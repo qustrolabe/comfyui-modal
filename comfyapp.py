@@ -23,7 +23,7 @@ except ImportError:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.7"
+COMFYAPP_VERSION = "2.0.8"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -35,37 +35,22 @@ CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 
 SUPPORTED_GPUS = ["a10g", "a100", "t4"]
 
-# NOTE: Do not use `.apt_install()` in separate layers on the legacy image
-# builder: its default `debian_slim` base is bullseye, whose
-# bullseye-security APT pool now returns 404 for many packages
-# (openssh-client, libasound2, ffmpeg, mesa, ...).
-# Pin bookworm explicitly and run `apt-get update + install` in a single
-# RUN layer so the package index can never go stale.
-APT_PACKAGES = "git libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 ffmpeg"
-
 
 def _base_image():
-    """Bookworm-based Python image, working on both legacy and new builders."""
-    try:
-        from_registry = getattr(modal.Image, "from_registry", None)
-        if callable(from_registry):
-            return from_registry("python:3.11-slim-bookworm")
-    except Exception:
-        pass
     return modal.Image.debian_slim(python_version="3.11")
-
-
-def _apt_install_cmd():
-    return (
-        "apt-get update && "
-        f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {APT_PACKAGES} "
-        "&& rm -rf /var/lib/apt/lists/*"
-    )
 
 
 image = (
     _base_image()
-    .run_commands(_apt_install_cmd())
+    .apt_install(
+        "git",
+        "libgl1",
+        "libglib2.0-0",
+        "libsm6",
+        "libxrender1",
+        "libxext6",
+        "ffmpeg",
+    )
     .pip_install("comfy-cli==1.3.7")
     .run_commands(
         "comfy --skip-prompt install --nvidia",
