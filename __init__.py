@@ -197,20 +197,6 @@ def _run_deploy_background():
         _deploy_status = {"state": "error", "message": str(e), "details": str(e)}
         print(f"[comfyui-modal] Deploy error: {e}")
 
-def _maybe_auto_deploy():
-    current_version = _get_comfyapp_version()
-    deployed_version = _get_deployed_version()
-
-    if current_version == deployed_version:
-        _deploy_status["state"] = "ready"
-        _deploy_status["message"] = f"Already deployed v{current_version}"
-        print(f"[comfyui-modal] comfyapp.py v{current_version} already deployed — skipping deploy")
-        return
-
-    print(f"[comfyui-modal] Version changed ({deployed_version} → {current_version}), starting background deploy...")
-    t = threading.Thread(target=_run_deploy_background, daemon=True)
-    t.start()
-
 try:
     from server import PromptServer
     import execution
@@ -224,7 +210,6 @@ try:
     import modal as _modal_pkg
     from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache
     _modal_available = True
-    _maybe_auto_deploy()
 except ImportError:
     _err_detail = f" (install error: {_pip_install_error})" if _pip_install_error else ""
     print(f"[comfyui-modal] WARNING: 'modal' package not installed.{_err_detail} Run: pip install modal")
