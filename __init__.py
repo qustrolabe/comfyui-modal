@@ -75,6 +75,13 @@ def _get_deployed_version():
     except FileNotFoundError:
         return None
 
+_deployed_version = _get_deployed_version()
+if _deployed_version:
+    # Report what is already on Modal instead of "idle". Without this the
+    # panel shows "Not deployed" on every restart and /health?mode=deploy
+    # answers 503, which reads as offline even though the app is live.
+    _deploy_status = {"state": "ready", "message": f"Deployed v{_deployed_version}"}
+
 def _set_deployed_version(version: str):
     with open(_DEPLOY_STATE_FILE, "w") as f:
         f.write(version)
