@@ -32,7 +32,7 @@ except ImportError:
 # the code after the next deploy. The node itself never uses that URL (it
 # uses the SDK + your Modal API token), so removing it cannot break Deploy /
 # Check / Wake Up / prompts / model management.
-COMFYAPP_VERSION = "2.0.10"
+COMFYAPP_VERSION = "2.0.11"
 
 # ComfyUI release installed into the Modal image.
 #
@@ -101,13 +101,16 @@ def _apt_install_cmd():
 image = (
     _base_image()
     .run_commands(_apt_install_cmd())
-    .pip_install("comfy-cli==1.3.7")
+    .pip_install("comfy-cli==1.23.0")
     .run_commands(
         # --version pins the exact ComfyUI release (see COMFYUI_VERSION above).
         # Without it `comfy install` falls back to `--version nightly`, which
         # freezes the image on whatever master was at build time (0.38.0)
         # forever, because Modal caches the layer and never re-resolves it.
-        f"comfy --skip-prompt install --nvidia --version {COMFYUI_VERSION}",
+        # --workspace pins the install location so a comfy-cli default change
+        # can never move ComfyUI out from under the hardcoded /root/comfy/ComfyUI
+        # paths used by the model/custom-node/input helpers below.
+        f"comfy --skip-prompt --workspace /root/comfy/ComfyUI install --nvidia --version {COMFYUI_VERSION}",
         gpu="a10g",
     )
     .add_local_python_source("workflow_inputs")
