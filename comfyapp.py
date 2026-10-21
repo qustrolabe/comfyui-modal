@@ -32,7 +32,7 @@ except ImportError:
 # the code after the next deploy. The node itself never uses that URL (it
 # uses the SDK + your Modal API token), so removing it cannot break Deploy /
 # Check / Wake Up / prompts / model management.
-COMFYAPP_VERSION = "2.0.12"
+COMFYAPP_VERSION = "2.0.13"
 
 # ComfyUI release installed into the Modal image.
 #
@@ -414,8 +414,19 @@ class _ComfyAPIMixin:
         """Symlink volume custom nodes into ComfyUI. Returns newly linked dirs."""
         import os
 
-        vol.reload()
-        custom_nodes_vol.reload()
+        # NOTE: a volume reload fails with "there are open files preventing the
+        # operation" when ComfyUI holds a model file open (mmap'ed safetensors).
+        # That must NOT abort the enter handler - an exception there kills the
+        # container and turns one failed start into an endless container churn.
+        # The mount still holds the current contents, so just log and continue.
+        try:
+            vol.reload()
+        except Exception as e:
+            print(f"[comfyui-modal] NOTE: models volume reload skipped ({e})")
+        try:
+            custom_nodes_vol.reload()
+        except Exception as e:
+            print(f"[comfyui-modal] NOTE: custom-nodes volume reload skipped ({e})")
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
         vol_cn_path = CUSTOM_NODES_PATH
         newly_linked = []
@@ -736,7 +747,19 @@ class _ComfyAPIMixin:
     def list_models(self):
         import os
 
-        vol.reload()
+        # NOTE: Modal refuses to refresh a volume while any file inside it is
+        # open by a process in the container ("there are open files preventing
+        # the operation"). ComfyUI keeps model files open (mmap'ed safetensors)
+        # for as long as the model is loaded, so this reload fails whenever a
+        # generation has a model resident. The listing is still correct - the
+        # files are right there on the mount - so treat a failed reload as
+        # "keep the current view" instead of failing the whole request. It
+        # used to raise, the route turned that into a 503, and the sidebar
+        # then claimed the app was not deployed yet.
+        try:
+            vol.reload()
+        except Exception as e:
+            print(f"[comfyui-modal] NOTE: volume reload skipped ({e}); listing the current view")
 
         # Standalone folders shown as their own sections
         solo_folders = ["loras", "vae", "controlnet", "upscale_models",
@@ -776,7 +799,19 @@ class _ComfyAPIMixin:
         if not os.path.isfile(target):
             return {"status": "error", "message": "File not found"}
         os.remove(target)
-        vol.commit()
+        # NOTE: the commit hits the same "open files preventing the operation"
+        # conflict as the volume reload when ComfyUI still holds another model
+        # file open. Report it clearly instead of raising a bare Modal error.
+        try:
+            vol.commit()
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": (
+                    f"Removed from the container view, but the volume commit failed: {e}. "
+                    "ComfyUI is holding a model file open - unload/close it and retry."
+                ),
+            }
         return {"status": "ok", "deleted": f"{safe_folder}/{safe_file}"}
 
 

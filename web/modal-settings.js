@@ -416,7 +416,24 @@ async function loadModels() {
   try {
     const resp = await api.fetchApi(`${MODAL_PREFIX}/models`);
     if (resp.status === 503) {
-      modelListEl.innerHTML = `<div style="color:#888;font-size:12px;line-height:1.6;">Modal app not deployed yet.<br>Click <b>Deploy to Cloud</b> above to get started.</div>`;
+      // NOTE: the route returns 503 for ANY failure, not only "not deployed".
+      // The JSON body carries the real reason (e.g. "there are open files
+      // preventing the operation" when ComfyUI holds a model file open), so
+      // show that instead of always claiming the app was never deployed.
+      let msg = "";
+      try {
+        const body = await resp.json();
+        if (body && body.message) msg = String(body.message);
+      } catch (e) { /* body was not JSON */ }
+      modelListEl.innerHTML = "";
+      const div = document.createElement("div");
+      div.style.cssText = "color:#e05;font-size:12px;line-height:1.6;";
+      if (msg) {
+        div.textContent = msg;
+      } else {
+        div.innerHTML = `Modal app not deployed yet.<br>Click <b>Deploy to Cloud</b> above to get started.`;
+      }
+      modelListEl.appendChild(div);
       if (modelsCollapsibleRef) modelsCollapsibleRef.refreshHeight();
       return;
     }
