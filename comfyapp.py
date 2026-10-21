@@ -23,6 +23,15 @@ except ImportError:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
+#
+# SECURITY: commenting out `ui()` below removes the app's only public
+# endpoint, but it only takes effect after a redeploy. Press **Deploy to
+# Cloud** in the node to apply it (the fork removed the startup auto-deploy,
+# so bumping this version alone will NOT trigger a redeploy). Bumping it
+# (e.g. to "2.0.10") is still good practice so the tracked version matches
+# the code after the next deploy. The node itself never uses that URL (it
+# uses the SDK + your Modal API token), so removing it cannot break Deploy /
+# Check / Wake Up / prompts / model management.
 COMFYAPP_VERSION = "2.0.9"
 
 APP_NAME = "comfyui"
@@ -97,21 +106,45 @@ vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
 
 
-@app.function(
-    gpu="a10g",
-    cpu=4,
-    memory=16384,
-    timeout=3600,
-    min_containers=0,
-    scaledown_window=2,
-    volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
-)
-@modal.web_server(COMFYUI_PORT, startup_timeout=300)
-def ui():
-    subprocess.Popen(
-        f"comfy launch -- --listen 0.0.0.0 --port {COMFYUI_PORT}",
-        shell=True,
-    )
+# ---------------------------------------------------------------------------
+# SECURITY: the public ComfyUI web UI is DISABLED here.
+#
+# `ui()` is a Modal Web Function, and Modal Web Functions are PUBLIC by
+# default unless `requires_proxy_auth=True` is set. With the plain decorator
+# below, anyone who learns the deterministic URL
+# (https://<workspace>--comfyui-ui.modal.run) gets a full ComfyUI UI + API on
+# an a10g container, with the models and custom-nodes volumes mounted.
+# See investigation/02-cbsakura-security-assessment.md.
+#
+# The comfyui-modal node does NOT use this endpoint: it talks to the app
+# through the Modal SDK (.remote()), authenticated by the Modal API token
+# (ak-/as-) in ~/.modal.toml — not by this web URL. So disabling `ui()` does
+# not affect the node, Deploy, Check, Wake Up, prompts, or model management.
+#
+# To re-enable it SAFELY, uncomment the block below AND add
+# `requires_proxy_auth=True` to the `@modal.web_server(...)` call. Then create
+# a Modal Proxy Token (Settings -> Proxy Auth Tokens; id `wk-`, secret `ws-`)
+# and send it as `Modal-Key`/`Modal-Secret` headers, or as
+# `Authorization: Bearer wk-...ws-...`. See investigation/03-modal-proxy-auth-howto.md.
+# ---------------------------------------------------------------------------
+# @app.function(
+#     gpu="a10g",
+#     cpu=4,
+#     memory=16384,
+#     timeout=3600,
+#     min_containers=0,
+#     scaledown_window=2,
+#     volumes={MODELS_PATH: vol, CUSTOM_NODES_PATH: custom_nodes_vol},
+# )
+# @modal.web_server(COMFYUI_PORT, startup_timeout=300)
+# def ui():
+#     subprocess.Popen(
+#         f"comfy launch -- --listen 0.0.0.0 --port {COMFYUI_PORT}",
+#         shell=True,
+#     )
+#
+# NOTE: COMFYUI_PORT (8188) is only used by the disabled ui() above; it is
+# left defined so re-enabling the block is a one-step change.
 
 
 @app.function(
