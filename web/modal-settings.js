@@ -486,6 +486,35 @@ function renderModelList(data) {
         row.appendChild(size);
       }
 
+      const phBtn = document.createElement("button");
+      phBtn.textContent = "\u2B07L";
+      phBtn.title = `Create local placeholder for ${file.name} (zero-byte; never overwrites an existing file)`;
+      phBtn.style.cssText = `
+        background: transparent; border: 1px solid #555; color: #7ed321;
+        width: 20px; height: 20px; border-radius: 3px; cursor: pointer;
+        font-size: 11px; flex-shrink: 0; line-height: 1;
+        display: flex; align-items: center; justify-content: center;
+      `;
+      phBtn.onclick = async () => {
+        phBtn.disabled = true;
+        try {
+          const r = await api.fetchApi(`${MODAL_PREFIX}/models/${file.folder ?? folder}/${encodeURIComponent(file.name)}/placeholder`, { method: "POST" });
+          const result = await r.json();
+          if (result.status === "ok") {
+            showToast("Placeholder created", "success");
+          } else if (result.status === "exists") {
+            const sizeTxt = result.size != null ? ` (${fmtSize(result.size)})` : "";
+            showToast(`Already exists${sizeTxt} — left untouched`, "info");
+          } else {
+            alert(`Failed: ${result.message}`);
+          }
+        } catch (e) {
+          alert(`Error: ${e.message}`);
+        }
+        phBtn.disabled = false;
+      };
+      row.appendChild(phBtn);
+
       const delBtn = document.createElement("button");
       delBtn.textContent = "\u2715";
       delBtn.title = `Delete ${file.name}`;

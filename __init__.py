@@ -687,6 +687,44 @@ if _server:
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+    @_server.routes.post("/comfymodal/models/{folder}/{filename}/placeholder")
+    async def modal_create_placeholder(request: web.Request) -> web.Response:
+        """Create a zero-byte local placeholder for a remote model.
+
+        Makes the model show up in ComfyUI's node dropdowns (model discovery)
+        without downloading the real weights, so a workflow can reference the
+        exact remote filename and still be routed to Modal.
+
+        SAFETY — never overwrites an existing file:
+        - folder/filename are reduced with os.path.basename (no path traversal);
+        - the file is opened in exclusive-create mode ("xb"), which raises
+          FileExistsError if ANY local file is already there — including a real,
+          large model. Existing files are reported and left byte-for-byte intact.
+        """
+        folder = os.path.basename(request.match_info.get("folder", ""))
+        filename = os.path.basename(request.match_info.get("filename", ""))
+        if not folder or not filename:
+            return web.json_response({"status": "error", "message": "folder and filename required"}, status=400)
+
+        target = os.path.join(_COMFYUI_ROOT, "models", folder, filename)
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "xb"):
+                pass  # zero-byte placeholder; "xb" refuses to touch an existing file
+        except FileExistsError:
+            # Existing file (real or placeholder): never truncate/overwrite it.
+            size = os.path.getsize(target)
+            return web.json_response({
+                "status": "exists",
+                "size": size,
+                "message": "Local file already exists — left untouched (never overwritten)",
+                "path": target,
+            })
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        return web.json_response({"status": "ok", "path": target})
+
     @_server.routes.get("/comfymodal/sync/status")
     async def modal_sync_status(request: web.Request) -> web.Response:
         """Get sync status: compare local models/custom_nodes with remote volumes."""
