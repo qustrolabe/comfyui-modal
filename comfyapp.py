@@ -32,7 +32,27 @@ except ImportError:
 # the code after the next deploy. The node itself never uses that URL (it
 # uses the SDK + your Modal API token), so removing it cannot break Deploy /
 # Check / Wake Up / prompts / model management.
-COMFYAPP_VERSION = "2.0.9"
+COMFYAPP_VERSION = "2.0.10"
+
+# ComfyUI release installed into the Modal image.
+#
+# WHY THIS HAS TO BE PINNED (why the container ran 0.38.0 while local ran 0.42.1):
+# `comfy install` defaults to `--version nightly`, i.e. "whatever the latest
+# commit on ComfyUI's master branch was at BUILD time". Modal caches the
+# image layer and `nightly` is never re-resolved, so the container stayed
+# frozen on the nightly the layer was built with (v0.38.0-8-g8cfe5e1e) even
+# though the local ComfyUI was already 0.42.1 -> workflows failed validation
+# with "KSampler: Exception when validating inner node: tuple index out of range".
+#
+# Pinning an explicit release does two things:
+#   1. installs the exact same version as the local ComfyUI, so workflows
+#      validate identically;
+#   2. changes the build command, so Modal's image-layer cache misses and the
+#      image is genuinely rebuilt instead of silently reusing the old one.
+#
+# To update ComfyUI on Modal: change this number and redeploy. Every change
+# to it forces a fresh image build.
+COMFYUI_VERSION = "0.42.1"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -83,7 +103,11 @@ image = (
     .run_commands(_apt_install_cmd())
     .pip_install("comfy-cli==1.3.7")
     .run_commands(
-        "comfy --skip-prompt install --nvidia",
+        # --version pins the exact ComfyUI release (see COMFYUI_VERSION above).
+        # Without it `comfy install` falls back to `--version nightly`, which
+        # freezes the image on whatever master was at build time (0.38.0)
+        # forever, because Modal caches the layer and never re-resolves it.
+        f"comfy --skip-prompt install --nvidia --version {COMFYUI_VERSION}",
         gpu="a10g",
     )
     .add_local_python_source("workflow_inputs")
