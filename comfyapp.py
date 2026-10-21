@@ -32,7 +32,7 @@ except ImportError:
 # the code after the next deploy. The node itself never uses that URL (it
 # uses the SDK + your Modal API token), so removing it cannot break Deploy /
 # Check / Wake Up / prompts / model management.
-COMFYAPP_VERSION = "2.0.11"
+COMFYAPP_VERSION = "2.0.12"
 
 # ComfyUI release installed into the Modal image.
 #
@@ -419,6 +419,7 @@ class _ComfyAPIMixin:
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
         vol_cn_path = CUSTOM_NODES_PATH
         newly_linked = []
+        req_files = []
         if os.path.isdir(vol_cn_path):
             for node_dir in sorted(os.listdir(vol_cn_path)):
                 src = os.path.join(vol_cn_path, node_dir)
@@ -426,24 +427,53 @@ class _ComfyAPIMixin:
                 if os.path.isdir(src) and not os.path.exists(dst):
                     os.symlink(src, dst)
                     newly_linked.append(node_dir)
-                    # Install requirements if present
+                    # Install requirements if present.
+                    # NOTE: ComfyUI never imports directories whose name ends
+                    # in ".disabled" (nodes.py: `if module_path.endswith(".disabled"):
+                    # continue`), so their dependencies are never imported and
+                    # installing them is pure waste on every container start.
+                    if node_dir.endswith(".disabled"):
+                        continue
                     req_file = os.path.join(src, "requirements.txt")
                     if os.path.isfile(req_file):
+                        req_files.append((node_dir, req_file))
+        if newly_linked:
+            print(f"[comfyui-modal] Linked custom nodes: {newly_linked}")
+        if req_files:
+            # NOTE: install every new node's requirements in ONE pip call so
+            # the dependency resolution (the slow part: index round-trips) is
+            # shared instead of paid once per node. Installing them one by one
+            # cost ~2 minutes for the synced set, and because the memory
+            # snapshot predates the sync that cost was repeated on EVERY
+            # container start. If the combined install fails, fall back to
+            # per-node installs so a single bad node can be identified.
+            print(f"[comfyui-modal] Installing requirements for: {[n for n, _ in req_files]}")
+            cmd = [sys.executable, "-m", "pip", "install"]
+            for _, req_file in req_files:
+                cmd += ["-r", req_file]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                if result.returncode != 0:
+                    print(
+                        "[comfyui-modal] WARNING: combined requirements install failed, "
+                        "retrying per node to isolate the culprit: "
+                        f"{(result.stderr or result.stdout)[-2000:]}"
+                    )
+                    for node_dir, req_file in req_files:
                         try:
-                            print(f"[comfyui-modal] Installing requirements for {node_dir}...")
-                            result = subprocess.run(
+                            single = subprocess.run(
                                 [sys.executable, "-m", "pip", "install", "-r", req_file],
                                 capture_output=True, text=True, timeout=600,
                             )
-                            if result.returncode != 0:
+                            if single.returncode != 0:
                                 print(
                                     f"[comfyui-modal] WARNING: requirements failed for {node_dir}: "
-                                    f"{(result.stderr or result.stdout)[-2000:]}"
+                                    f"{(single.stderr or single.stdout)[-2000:]}"
                                 )
                         except Exception as e:
                             print(f"[comfyui-modal] WARNING: Failed to install requirements for {node_dir}: {e}")
-        if newly_linked:
-            print(f"[comfyui-modal] Linked custom nodes: {newly_linked}")
+            except Exception as e:
+                print(f"[comfyui-modal] WARNING: Failed to install requirements: {e}")
         return newly_linked
 
     def _start_comfy(self):
@@ -455,13 +485,110 @@ class _ComfyAPIMixin:
 
     def _restart_comfy(self):
         proc = getattr(self, "_proc", None)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        # NOTE: guard the terminate calls. On the memory-snapshot restore path
+        # `self._proc` refers to a process that belongs to the SNAPSHOT, not to
+        # this container, so terminate()/wait() can raise (e.g. ProcessLookupError
+        # / ChildProcessError). An exception here would abort the enter handler
+        # and kill the container, which is what turned one bad restart into an
+        # endless container churn.
+        if proc is not None:
             try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except Exception as e:
+                print(f"[comfyui-modal] NOTE: could not stop the previous ComfyUI process: {e}")
+        # NOTE: on the memory-snapshot restore path `self._proc` is a Popen
+        # object restored from the snapshot. terminate() does NOT reliably stop
+        # the RESTORED ComfyUI process, which keeps port 8189 bound. The
+        # replacement `comfy launch` then dies with
+        # "Port 8189 is already in use on address 0.0.0.0" and the container
+        # silently keeps serving the STALE ComfyUI from the snapshot (i.e. the
+        # OLD custom-node versions) -> workflows fail validation with
+        # "Exception when validating inner node: tuple index out of range".
+        # Kill the real ComfyUI processes and wait until the port is actually
+        # free before relaunching, otherwise the reload silently does nothing.
+        self._kill_comfyui_processes()
+        self._wait_for_port_free()
         self._start_comfy()
+
+    def _kill_comfyui_processes(self):
+        """SIGTERM (then SIGKILL) the running ComfyUI server process.
+
+        `pkill` is not available in the slim image (no `procps` package), so
+        /proc is scanned directly. Only a process whose command line mentions
+        `main.py` AND whose working directory is the ComfyUI install dir is
+        targeted, so the Modal worker can never be hit. The `comfy launch`
+        wrapper exits by itself once its child is gone.
+        """
+        import signal
+
+        comfy_dir = "/root/comfy/ComfyUI"
+
+        def target_pids():
+            pids = []
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                if pid == os.getpid():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/cmdline", "rb") as f:
+                        cmdline = f.read().decode("utf-8", "replace").replace("\x00", " ")
+                except Exception:
+                    continue
+                if "main.py" not in cmdline:
+                    continue
+                try:
+                    cwd = os.readlink(f"/proc/{entry}/cwd")
+                except Exception:
+                    continue
+                if cwd.rstrip("/").lower() != comfy_dir.lower():
+                    continue
+                pids.append(pid)
+            return pids
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            pids = target_pids()
+            if not pids:
+                return
+            print(f"[comfyui-modal] Sending {sig.name} to ComfyUI process(es): {pids}")
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+            for _ in range(50):
+                if not target_pids():
+                    return
+                time.sleep(0.2)
+
+    def _wait_for_port_free(self, timeout=60):
+        """Block until nothing is listening on the ComfyUI API port.
+
+        Starting a second ComfyUI while the first one still holds the port
+        makes the new process exit immediately with "Port 8189 is already in
+        use", which is exactly what silently broke the custom-node reload.
+        """
+        import socket
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            sock = socket.socket()
+            sock.settimeout(1)
+            try:
+                sock.connect(("127.0.0.1", COMFYUI_API_PORT))
+            except OSError:
+                return True
+            finally:
+                sock.close()
+            time.sleep(0.5)
+        print(f"[comfyui-modal] WARNING: port {COMFYUI_API_PORT} still busy after {timeout}s")
+        return False
 
     @modal.exit()
     def shutdown(self):
