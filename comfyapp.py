@@ -32,7 +32,11 @@ except ImportError:
 # the code after the next deploy. The node itself never uses that URL (it
 # uses the SDK + your Modal API token), so removing it cannot break Deploy /
 # Check / Wake Up / prompts / model management.
-COMFYAPP_VERSION = "2.0.13"
+# 2.0.14: live event relay. The container can now report ComfyUI's live
+# events (progress / executing / preview frames) back to the browser while the
+# prompt is running, and it returns its own status messages so the queue panel
+# can show the real execution duration. See run_prompt_stream().
+COMFYAPP_VERSION = "2.0.14"
 
 # ComfyUI release installed into the Modal image.
 #
@@ -63,6 +67,38 @@ MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 
 SUPPORTED_GPUS = ["a10g", "a100", "t4"]
+
+# ComfyUI's binary websocket event types (comfy_api/protocol.py).
+BINARY_EVENT_PREVIEW_IMAGE = 1
+BINARY_EVENT_UNENCODED_PREVIEW_IMAGE = 2
+BINARY_EVENT_TEXT = 3
+BINARY_EVENT_PREVIEW_IMAGE_WITH_METADATA = 4
+
+# The text events that are relayed to the browser while the prompt runs.
+#
+# Deliberately NOT relayed: execution_start / execution_success /
+# execution_error / execution_interrupted / executed / execution_cached.
+# The comfyui-modal node already emits those itself (it owns the local
+# prompt lifecycle), so relaying the container's copies would make the
+# browser see every one of them twice.
+#
+# "progress_state" is the important one: it is the per-node progress map
+# (comfy_execution/progress.py:161-186) that drives the progress bar on the
+# canvas in the 0.42.1 frontend. "progress" is the older flat
+# {value, max, node} variant and is relayed as well so both consumers are fed.
+# "executing" carries the node that is actually running, plus display_node
+# (execution.py:497) - the frontend reads `data.display_node || data.node`.
+RELAYED_TEXT_EVENTS = ("progress", "progress_state", "executing")
+
+# Feature flags the container-side websocket client announces. Without
+# "supports_preview_metadata" ComfyUI downgrades the preview frames to
+# UNENCODED_PREVIEW_IMAGE, which carries no node metadata - the browser then
+# cannot attach the preview to the right node
+# (comfy_execution/progress.py:207-229).
+CONTAINER_CLIENT_FEATURE_FLAGS = {
+    "supports_preview_metadata": True,
+    "supports_progress_text_metadata": True,
+}
 
 # NOTE: Do not use `.apt_install()` in separate layers on the legacy image
 # builder: its default `debian_slim` base is bullseye, whose
@@ -626,8 +662,37 @@ class _ComfyAPIMixin:
         with urllib.request.urlopen(f"http://127.0.0.1:{COMFYUI_API_PORT}/object_info") as r:
             return json.loads(r.read())
 
-    @modal.method()
-    def run_prompt(self, workflow: dict, input_images: dict = None) -> dict:
+    def _prompt_extra_data(self, preview_method: str = "") -> dict:
+        """The extra_data that is sent to the container's own ComfyUI.
+
+        `preview_method` is the only thing we forward, and it is what makes
+        live previews possible at all: ComfyUI resets its global preview
+        method to the CLI default (--preview-method none) for EVERY prompt
+        unless the prompt carries an override
+        (execution.py:734 -> latent_preview.py:142-148). Without it the
+        container renders no preview frames whatsoever.
+
+        Nothing else from the browser's extra_data is forwarded: it also
+        carries the user's ComfyUI.org credentials (auth_token_comfy_org /
+        api_key_comfy_org) and the whole workflow under extra_pnginfo - none
+        of that may be shipped to a third-party cloud.
+        """
+        extra = {}
+        if preview_method and preview_method != "default":
+            extra["preview_method"] = preview_method
+        return extra
+
+    def _submit_prompt_to_comfy(self, workflow, input_images, prompt_id, client_id, extra_data):
+        """POST a prompt to the container's own ComfyUI and return its reply.
+
+        `prompt_id` is the id the LOCAL ComfyUI already handed to the
+        browser. ComfyUI 0.42.1 accepts a client-supplied prompt id
+        (server.py:1179-1193, validated by comfy_execution/jobs.py:34-51) as
+        long as it is a UUID in canonical lowercase-hyphenated form - which is
+        exactly what str(uuid.uuid4()) produces. Re-using it means every event
+        the container emits already carries the id the browser filters on, so
+        nothing has to be rewritten on the way back.
+        """
         import urllib.request
         import urllib.error
         from pathlib import Path
@@ -638,8 +703,12 @@ class _ComfyAPIMixin:
                 input_images,
             )
 
-        client_id = str(uuid.uuid4())
-        payload = json.dumps({"prompt": workflow, "client_id": client_id}).encode()
+        body = {"prompt": workflow, "client_id": client_id}
+        if prompt_id:
+            body["prompt_id"] = prompt_id
+        if extra_data:
+            body["extra_data"] = extra_data
+        payload = json.dumps(body).encode()
 
         req = urllib.request.Request(
             f"http://127.0.0.1:{COMFYUI_API_PORT}/prompt",
@@ -648,7 +717,7 @@ class _ComfyAPIMixin:
         )
         try:
             with urllib.request.urlopen(req) as r:
-                queued = json.loads(r.read())
+                return json.loads(r.read())
         except urllib.error.HTTPError as e:
             # Read the response body for validation error details
             error_body = ""
@@ -685,10 +754,44 @@ class _ComfyAPIMixin:
                     raise
             raise RuntimeError(f"ComfyUI rejected the prompt (HTTP {e.code}): {error_body[:500]}") from e
 
-        prompt_id = queued["prompt_id"]
-        return self._poll_until_done(prompt_id, client_id)
+    @modal.method()
+    def run_prompt(self, workflow: dict, input_images: dict = None,
+                   prompt_id: str = "", client_id: str = "",
+                   preview_method: str = "") -> dict:
+        """Run a prompt and return the finished outputs (no live events).
+
+        This is the ORIGINAL, non-streaming entry point and it is kept on
+        purpose:
+          * an older comfyui-modal node (one that was loaded before this
+            change) keeps working against a newly deployed app, and
+          * the node has a fallback for a deployed app that does not have
+            run_prompt_stream yet (i.e. one that was not redeployed after
+            this change).
+        The node prefers run_prompt_stream(), which additionally relays
+        ComfyUI's live events while the prompt runs.
+        """
+        if not client_id:
+            client_id = str(uuid.uuid4())
+        queued = self._submit_prompt_to_comfy(
+            workflow,
+            input_images,
+            prompt_id,
+            client_id,
+            self._prompt_extra_data(preview_method),
+        )
+        return self._poll_until_done(queued["prompt_id"], client_id)
 
     def _poll_until_done(self, prompt_id: str, client_id: str) -> dict:
+        """Wait for the prompt to finish and collect its outputs.
+
+        The returned dict also carries the container's own `status.messages`.
+        Those are the timestamps ComfyUI stamped on the real execution
+        (execution.py:680-685) and they are the most accurate duration source
+        available: they bracket the actual GPU work and exclude Modal's queue
+        and RPC overhead. The shape is exactly what the frontend needs - a list
+        of [event_name, data] pairs where data["timestamp"] is in milliseconds
+        (comfy_execution/jobs.py:226-238).
+        """
         import urllib.request
         delay = 0.5
         elapsed = 0.0
@@ -698,12 +801,248 @@ class _ComfyAPIMixin:
             ) as r:
                 history = json.loads(r.read())
             if prompt_id in history:
-                outputs = history[prompt_id].get("outputs", {})
-                return self._collect_outputs(outputs)
+                entry = history[prompt_id]
+                status = entry.get("status") or {}
+                messages = status.get("messages", []) or []
+                if status.get("status_str") == "error":
+                    # The prompt was accepted but failed while executing.
+                    # Raising here (instead of returning empty outputs) is
+                    # what lets the browser show the error and lets the queue
+                    # panel record an "execution_error" timestamp.
+                    raise RuntimeError(self._describe_error(messages))
+                outputs = entry.get("outputs", {})
+                return {**self._collect_outputs(outputs), "messages": messages}
             time.sleep(delay)
             elapsed += delay
             delay = min(delay * 1.5, 5.0)
         raise TimeoutError(f"Prompt {prompt_id} timed out")
+
+    @staticmethod
+    def _describe_error(messages) -> str:
+        """Human-readable text for a failed prompt, taken from its messages."""
+        for entry in messages or []:
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2 and entry[0] == "execution_error":
+                data = entry[1]
+                if isinstance(data, dict):
+                    return str(
+                        data.get("exception_message")
+                        or data.get("message")
+                        or "the remote prompt failed"
+                    )
+        return "the remote prompt failed"
+
+    # ------------------------------------------------------------------
+    # Live event relay
+    # ------------------------------------------------------------------
+
+    @modal.method()
+    async def run_prompt_stream(self, workflow: dict, input_images: dict = None,
+                                prompt_id: str = "", client_id: str = "",
+                                preview_method: str = "") -> None:
+        """Run a prompt and stream ComfyUI's live events back to the caller.
+
+        Yields a sequence of dicts:
+          {"kind": "event",   "event": <name>, "data": <payload>}
+          {"kind": "preview", "metadata": {...}, "image": <encoded bytes>}
+          {"kind": "result",  "result": {"images": [...], "videos": [...],
+                                         "messages": [...]}}
+
+        WHY A GENERATOR: a Modal generator method streams its yielded values
+        back over the SAME RPC that runs the function, so the events come from
+        the very container that is executing the prompt. A separate polling
+        method would have to land on the same container - the app runs with
+        @modal.concurrent(max_inputs=1) - which Modal does not guarantee.
+        The generator removes that problem by construction.
+
+        The container-side websocket is opened BEFORE the prompt is
+        submitted, so not a single event is missed.
+        """
+        import asyncio
+        import aiohttp
+
+        if not client_id:
+            client_id = str(uuid.uuid4())
+        if not prompt_id:
+            prompt_id = str(uuid.uuid4())
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async with aiohttp.ClientSession() as session:
+            url = f"http://127.0.0.1:{COMFYUI_API_PORT}/ws?clientId={client_id}"
+            async with session.ws_connect(url) as ws:
+                # The feature-flag handshake MUST be the first message on the
+                # socket: ComfyUI only records the flags from the first
+                # message (server.py:359-381). Without it the preview frames
+                # lose their node metadata and the browser cannot attach them
+                # to the right node.
+                await ws.send_str(json.dumps({
+                    "type": "feature_flags",
+                    "data": CONTAINER_CLIENT_FEATURE_FLAGS,
+                }))
+
+                reader = asyncio.create_task(self._ws_event_reader(ws, queue))
+                try:
+                    # The submission is a blocking urllib call, so it runs in
+                    # a thread - otherwise it would stall the event loop and
+                    # with it the websocket reader.
+                    queued = await asyncio.to_thread(
+                        self._submit_prompt_to_comfy,
+                        workflow,
+                        input_images,
+                        prompt_id,
+                        client_id,
+                        self._prompt_extra_data(preview_method),
+                    )
+                except Exception:
+                    reader.cancel()
+                    raise
+
+                remote_prompt_id = queued.get("prompt_id", prompt_id)
+
+                async def watch_completion():
+                    try:
+                        result = await asyncio.to_thread(
+                            self._poll_until_done, remote_prompt_id, client_id
+                        )
+                        await queue.put({"kind": "result", "result": result})
+                    except Exception as e:
+                        await queue.put({"kind": "error", "error": str(e) or repr(e)})
+
+                watcher = asyncio.create_task(watch_completion())
+
+                try:
+                    while True:
+                        item = await queue.get()
+                        kind = item.get("kind")
+                        if kind == "error":
+                            raise RuntimeError(item.get("error", "the remote prompt failed"))
+                        if kind == "result":
+                            # The last couple of frames ("executing: null",
+                            # "execution_success") are sent right before the
+                            # history entry is written, so give the reader a
+                            # moment to pick them up before finishing.
+                            await asyncio.sleep(0.3)
+                            tail = []
+                            while True:
+                                try:
+                                    extra = queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                                if extra.get("kind") not in ("result", "error"):
+                                    tail.append(extra)
+                            for extra in tail:
+                                yield extra
+                            yield item
+                            break
+                        yield item
+                except asyncio.CancelledError:
+                    # The browser cancelled the prompt. Tell the container's
+                    # ComfyUI to stop, so it does not keep sampling (and
+                    # burning the GPU) until the prompt finishes on its own.
+                    # A plain call, not an await: the task is being
+                    # cancelled, so anything awaited here could be cancelled
+                    # again before it runs. It is a local HTTP call and takes
+                    # a couple of milliseconds.
+                    self._interrupt_comfy(remote_prompt_id)
+                    raise
+                finally:
+                    reader.cancel()
+                    watcher.cancel()
+
+    def _interrupt_comfy(self, prompt_id: str = "") -> None:
+        """Ask the container's own ComfyUI to stop the running prompt.
+
+        Without this, cancelling a prompt in the browser only cancels the
+        LOCAL side: the container's ComfyUI keeps sampling until the prompt
+        finishes on its own, burning the GPU (Modal's own cancel() does not
+        stop the process either - it only releases the input slot).
+        """
+        import urllib.request
+        import urllib.error
+
+        body = {"prompt_id": prompt_id} if prompt_id else {}
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{COMFYUI_API_PORT}/interrupt",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            print(f"[comfyui-modal] interrupted the remote prompt {prompt_id}")
+        except Exception as e:
+            print(f"[comfyui-modal] could not interrupt the remote prompt: {e}")
+
+    async def _ws_event_reader(self, ws, queue):
+        """Read the container's own ComfyUI websocket and queue its events.
+
+        Text frames are the JSON events ("progress", "progress_state",
+        "executing", ...). Binary frames are the preview images; ComfyUI
+        frames them as [4-byte event type][payload]
+        (server.py:1398-1404, :1431-1466).
+        """
+        import asyncio
+        import aiohttp
+
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    data = msg.data
+                    if len(data) < 4:
+                        continue
+                    event = int.from_bytes(data[:4], "big")
+                    payload = data[4:]
+                    if event == BINARY_EVENT_PREVIEW_IMAGE_WITH_METADATA:
+                        item = self._decode_preview_frame(payload)
+                        if item is not None:
+                            await queue.put(item)
+                    # The other binary frames (plain preview images) are NOT
+                    # relayed: without the node metadata the browser cannot
+                    # attach them to a node, so they would only be noise.
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        obj = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    event = obj.get("type")
+                    if event in RELAYED_TEXT_EVENTS:
+                        await queue.put({
+                            "kind": "event",
+                            "event": event,
+                            "data": obj.get("data"),
+                        })
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[comfyui-modal] event reader stopped: {e}")
+
+    @staticmethod
+    def _decode_preview_frame(payload: bytes):
+        """Split a type-4 preview frame into its metadata and image bytes.
+
+        Wire format (server.py:1431-1466):
+            [4-byte metadata length][metadata JSON][image bytes]
+        The image is already JPEG-encoded by the container's ComfyUI, so it is
+        shipped as-is and decoded on the other side.
+        """
+        if len(payload) < 4:
+            return None
+        meta_len = int.from_bytes(payload[:4], "big")
+        try:
+            metadata = json.loads(payload[4:4 + meta_len].decode("utf-8"))
+        except Exception:
+            return None
+        image = payload[4 + meta_len:]
+        if not image:
+            return None
+        return {"kind": "preview", "metadata": metadata, "image": image}
 
     def _collect_outputs(self, outputs: dict) -> dict:
         import urllib.request

@@ -62,10 +62,101 @@ def _modal_error_handler(func):
     return wrapper
 
 
+def _is_missing_method(exc: Exception) -> bool:
+    """True when the error means "the deployed app cannot stream a prompt".
+
+    Used to fall back to the plain (non-streaming) prompt method when the
+    cloud app was not redeployed after the streaming one was added, or when
+    the deployed Modal version cannot run generator methods.
+    """
+    if type(exc).__name__ in ("NotFoundError", "InvalidError"):
+        return True
+    text = str(exc).lower()
+    if "has no method" in text or "non-generator" in text:
+        return True
+    if "generator" in text and (
+        "not supported" in text or "unsupported" in text
+        or "not implemented" in text or "unknown" in text
+    ):
+        return True
+    return False
+
+
+async def _run_streaming(api, workflow, input_images, prompt_id, client_id, preview_method, on_event):
+    """Consume the container's streaming prompt method.
+
+    Returns the result dict, or None when the deployed app does not have the
+    streaming method (or the deployed Modal version cannot run generators) -
+    the caller then falls back to the plain, non-streaming method.
+    """
+    try:
+        stream_fn = api.run_prompt_stream
+    except Exception:
+        # The deployed app predates run_prompt_stream.
+        return None
+
+    got_item = False
+    result = None
+    stream = stream_fn.remote_gen(workflow, input_images, prompt_id, client_id, preview_method)
+    try:
+        async for item in stream:
+            kind = item.get("kind")
+            if kind == "result":
+                # Do not break out of the loop: let the remote stream end on
+                # its own so the RPC is closed cleanly.
+                result = item.get("result")
+                continue
+            got_item = True
+            if on_event is not None:
+                await on_event(item)
+    except Exception as e:
+        if got_item or not _is_missing_method(e):
+            raise
+        print(
+            f"[comfyui-modal] the deployed app has no streaming prompt method ({e}); "
+            f"using the plain one - live progress and previews stay off until "
+            f"the app is redeployed"
+        )
+        return None
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+
+    if result is None:
+        raise RuntimeError("Modal returned no result for the prompt")
+    return result
+
+
 @_modal_error_handler
-async def run_prompt(workflow: dict, input_images: dict = None) -> dict:
+async def run_prompt(workflow: dict, input_images: dict = None, prompt_id: str = "",
+                     client_id: str = "", preview_method: str = "",
+                     on_event=None) -> dict:
+    """Run a prompt on Modal.
+
+    `on_event` is an optional async callback that receives the container's live
+    events as they arrive:
+        {"kind": "event",   "event": <name>, "data": <payload>}
+        {"kind": "preview", "metadata": {...}, "image": <bytes>}
+    """
+    api = _api()
+    result = await _run_streaming(
+        api, workflow, input_images or {}, prompt_id, client_id, preview_method, on_event
+    )
+    if result is not None:
+        return result
+
+    # Fallback: the deployed app does not have the streaming method (it was
+    # not redeployed after the feature was added) or the deployed Modal version
+    # cannot run generators. The prompt still runs and its images still come
+    # back - only the live progress and the previews are missing.
+    #
+    # The legacy call keeps the ORIGINAL two-argument signature on purpose:
+    # that is the signature the currently deployed app has, and the new one
+    # accepts it as well.
     return await asyncio.to_thread(
-        lambda: _api().run_prompt.remote(workflow, input_images or {}),
+        lambda: api.run_prompt.remote(workflow, input_images or {}),
     )
 
 
