@@ -82,6 +82,36 @@ def _is_missing_method(exc: Exception) -> bool:
     return False
 
 
+async def _as_async_iter(sync_iterable):
+    """Wrap a blocking iterable into an async one.
+
+    Only used if the installed Modal SDK does not expose the `.aio` variant
+    of `remote_gen`. The blocking generator is advanced in a thread so the
+    local ComfyUI event loop stays free while we wait for the next event.
+    """
+    import asyncio
+    import functools
+
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+    iterator = iter(sync_iterable)
+    try:
+        while True:
+            item = await loop.run_in_executor(
+                None, functools.partial(next, iterator, sentinel)
+            )
+            if item is sentinel:
+                return
+            yield item
+    finally:
+        close = getattr(sync_iterable, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 async def _run_streaming(api, workflow, input_images, prompt_id, client_id, preview_method, on_event):
     """Consume the container's streaming prompt method.
 
@@ -95,9 +125,22 @@ async def _run_streaming(api, workflow, input_images, prompt_id, client_id, prev
         print(f"[comfyui-modal] no streaming prompt method: {type(e).__name__}: {e}")
         return None
 
+    # IMPORTANT: `remote_gen` is an ASYNC generator function, but the Modal
+    # SDK exposes it through synchronicity, which hands out the BLOCKING
+    # variant by default - a plain sync generator. `async for` cannot consume
+    # that ("'async for' requires an object with __aiter__ method, got
+    # generator"), so the `.aio` variant has to be used explicitly.
+    remote_gen = stream_fn.remote_gen
+    aio_variant = getattr(remote_gen, "aio", None)
+    if aio_variant is not None:
+        stream = aio_variant(workflow, input_images, prompt_id, client_id, preview_method)
+    else:
+        stream = _as_async_iter(
+            remote_gen(workflow, input_images, prompt_id, client_id, preview_method)
+        )
+
     got_item = False
     result = None
-    stream = stream_fn.remote_gen(workflow, input_images, prompt_id, client_id, preview_method)
     try:
         async for item in stream:
             kind = item.get("kind")
