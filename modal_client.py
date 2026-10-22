@@ -62,10 +62,155 @@ def _modal_error_handler(func):
     return wrapper
 
 
+def _is_missing_method(exc: Exception) -> bool:
+    """True when the error means "the deployed app cannot stream a prompt".
+
+    Kept for reference: the fallback now triggers on ANY failure that happens
+    before the container acknowledged the prompt, because that is the only
+    case where running the prompt a second time is safe.
+    """
+    if type(exc).__name__ in ("NotFoundError", "InvalidError"):
+        return True
+    text = str(exc).lower()
+    if "has no method" in text or "non-generator" in text:
+        return True
+    if "generator" in text and (
+        "not supported" in text or "unsupported" in text
+        or "not implemented" in text or "unknown" in text
+    ):
+        return True
+    return False
+
+
+async def _as_async_iter(sync_iterable):
+    """Wrap a blocking iterable into an async one.
+
+    Only used if the installed Modal SDK does not expose the `.aio` variant
+    of `remote_gen`. The blocking generator is advanced in a thread so the
+    local ComfyUI event loop stays free while we wait for the next event.
+    """
+    import asyncio
+    import functools
+
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+    iterator = iter(sync_iterable)
+    try:
+        while True:
+            item = await loop.run_in_executor(
+                None, functools.partial(next, iterator, sentinel)
+            )
+            if item is sentinel:
+                return
+            yield item
+    finally:
+        close = getattr(sync_iterable, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
+async def _run_streaming(api, workflow, input_images, prompt_id, client_id, preview_method, on_event):
+    """Consume the container's streaming prompt method.
+
+    Returns the result dict, or None when the streaming path could not be
+    used - the caller then falls back to the plain (non-streaming) method.
+    """
+    try:
+        stream_fn = api.run_prompt_stream
+    except Exception as e:
+        # The deployed app predates run_prompt_stream.
+        print(f"[comfyui-modal] no streaming prompt method: {type(e).__name__}: {e}")
+        return None
+
+    # IMPORTANT: `remote_gen` is an ASYNC generator function, but the Modal
+    # SDK exposes it through synchronicity, which hands out the BLOCKING
+    # variant by default - a plain sync generator. `async for` cannot consume
+    # that ("'async for' requires an object with __aiter__ method, got
+    # generator"), so the `.aio` variant has to be used explicitly.
+    remote_gen = stream_fn.remote_gen
+    aio_variant = getattr(remote_gen, "aio", None)
+    if aio_variant is not None:
+        stream = aio_variant(workflow, input_images, prompt_id, client_id, preview_method)
+    else:
+        stream = _as_async_iter(
+            remote_gen(workflow, input_images, prompt_id, client_id, preview_method)
+        )
+
+    got_item = False
+    result = None
+    try:
+        async for item in stream:
+            kind = item.get("kind")
+            if kind == "result":
+                # Do not break out of the loop: let the remote stream end on
+                # its own so the RPC is closed cleanly.
+                result = item.get("result")
+                continue
+            if kind == "started":
+                # The container has the prompt now - from here on a failure
+                # must NOT be retried with the plain method, because that
+                # would run the prompt twice.
+                got_item = True
+                continue
+            got_item = True
+            if on_event is not None:
+                await on_event(item)
+    except Exception as e:
+        if got_item:
+            # The prompt is already running on the container; retrying it
+            # would generate it twice. Let the error through.
+            raise
+        # Nothing came back at all, so the prompt was (almost certainly)
+        # never submitted - fall back to the plain method instead of failing
+        # the run.
+        import traceback
+        print(f"[comfyui-modal] the streaming prompt method failed, using the "
+              f"plain one (live progress and previews stay off): "
+              f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+
+    if result is None:
+        raise RuntimeError("Modal returned no result for the prompt")
+    return result
+
+
 @_modal_error_handler
-async def run_prompt(workflow: dict, input_images: dict = None) -> dict:
+async def run_prompt(workflow: dict, input_images: dict = None, prompt_id: str = "",
+                     client_id: str = "", preview_method: str = "",
+                     on_event=None) -> dict:
+    """Run a prompt on Modal.
+
+    `on_event` is an optional async callback that receives the container's live
+    events as they arrive:
+        {"kind": "event",   "event": <name>, "data": <payload>}
+        {"kind": "preview", "metadata": {...}, "image": <bytes>}
+    """
+    api = _api()
+    result = await _run_streaming(
+        api, workflow, input_images or {}, prompt_id, client_id, preview_method, on_event
+    )
+    if result is not None:
+        return result
+
+    # Fallback: the deployed app does not have the streaming method (it was
+    # not redeployed after the feature was added) or the deployed Modal version
+    # cannot run generators. The prompt still runs and its images still come
+    # back - only the live progress and the previews are missing.
+    #
+    # The legacy call keeps the ORIGINAL two-argument signature on purpose:
+    # that is the signature the currently deployed app has, and the new one
+    # accepts it as well.
     return await asyncio.to_thread(
-        lambda: _api().run_prompt.remote(workflow, input_images or {}),
+        lambda: api.run_prompt.remote(workflow, input_images or {}),
     )
 
 

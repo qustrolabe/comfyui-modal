@@ -416,7 +416,24 @@ async function loadModels() {
   try {
     const resp = await api.fetchApi(`${MODAL_PREFIX}/models`);
     if (resp.status === 503) {
-      modelListEl.innerHTML = `<div style="color:#888;font-size:12px;line-height:1.6;">Modal app not deployed yet.<br>Click <b>Deploy to Cloud</b> above to get started.</div>`;
+      // NOTE: the route returns 503 for ANY failure, not only "not deployed".
+      // The JSON body carries the real reason (e.g. "there are open files
+      // preventing the operation" when ComfyUI holds a model file open), so
+      // show that instead of always claiming the app was never deployed.
+      let msg = "";
+      try {
+        const body = await resp.json();
+        if (body && body.message) msg = String(body.message);
+      } catch (e) { /* body was not JSON */ }
+      modelListEl.innerHTML = "";
+      const div = document.createElement("div");
+      div.style.cssText = "color:#e05;font-size:12px;line-height:1.6;";
+      if (msg) {
+        div.textContent = msg;
+      } else {
+        div.innerHTML = `Modal app not deployed yet.<br>Click <b>Deploy to Cloud</b> above to get started.`;
+      }
+      modelListEl.appendChild(div);
       if (modelsCollapsibleRef) modelsCollapsibleRef.refreshHeight();
       return;
     }
@@ -485,6 +502,35 @@ function renderModelList(data) {
         row.appendChild(name);
         row.appendChild(size);
       }
+
+      const phBtn = document.createElement("button");
+      phBtn.textContent = "\u2B07L";
+      phBtn.title = `Create local placeholder for ${file.name} (zero-byte; never overwrites an existing file)`;
+      phBtn.style.cssText = `
+        background: transparent; border: 1px solid #555; color: #7ed321;
+        width: 20px; height: 20px; border-radius: 3px; cursor: pointer;
+        font-size: 11px; flex-shrink: 0; line-height: 1;
+        display: flex; align-items: center; justify-content: center;
+      `;
+      phBtn.onclick = async () => {
+        phBtn.disabled = true;
+        try {
+          const r = await api.fetchApi(`${MODAL_PREFIX}/models/${file.folder ?? folder}/${encodeURIComponent(file.name)}/placeholder`, { method: "POST" });
+          const result = await r.json();
+          if (result.status === "ok") {
+            showToast("Placeholder created", "success");
+          } else if (result.status === "exists") {
+            const sizeTxt = result.size != null ? ` (${fmtSize(result.size)})` : "";
+            showToast(`Already exists${sizeTxt} — left untouched`, "info");
+          } else {
+            alert(`Failed: ${result.message}`);
+          }
+        } catch (e) {
+          alert(`Error: ${e.message}`);
+        }
+        phBtn.disabled = false;
+      };
+      row.appendChild(phBtn);
 
       const delBtn = document.createElement("button");
       delBtn.textContent = "\u2715";

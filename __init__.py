@@ -75,6 +75,13 @@ def _get_deployed_version():
     except FileNotFoundError:
         return None
 
+_deployed_version = _get_deployed_version()
+if _deployed_version:
+    # Report what is already on Modal instead of "idle". Without this the
+    # panel shows "Not deployed" on every restart and /health?mode=deploy
+    # answers 503, which reads as offline even though the app is live.
+    _deploy_status = {"state": "ready", "message": f"Deployed v{_deployed_version}"}
+
 def _set_deployed_version(version: str):
     with open(_DEPLOY_STATE_FILE, "w") as f:
         f.write(version)
@@ -197,20 +204,6 @@ def _run_deploy_background():
         _deploy_status = {"state": "error", "message": str(e), "details": str(e)}
         print(f"[comfyui-modal] Deploy error: {e}")
 
-def _maybe_auto_deploy():
-    current_version = _get_comfyapp_version()
-    deployed_version = _get_deployed_version()
-
-    if current_version == deployed_version:
-        _deploy_status["state"] = "ready"
-        _deploy_status["message"] = f"Already deployed v{current_version}"
-        print(f"[comfyui-modal] comfyapp.py v{current_version} already deployed — skipping deploy")
-        return
-
-    print(f"[comfyui-modal] Version changed ({deployed_version} → {current_version}), starting background deploy...")
-    t = threading.Thread(target=_run_deploy_background, daemon=True)
-    t.start()
-
 try:
     from server import PromptServer
     import execution
@@ -224,7 +217,6 @@ try:
     import modal as _modal_pkg
     from modal_client import run_prompt, get_object_info, health_check, download_model, batch_download_models, list_models, delete_model, set_gpu, get_gpu, sync_custom_nodes, get_sync_status, upload_model_to_volume, upload_model_chunk, clear_cache
     _modal_available = True
-    _maybe_auto_deploy()
 except ImportError:
     _err_detail = f" (install error: {_pip_install_error})" if _pip_install_error else ""
     print(f"[comfyui-modal] WARNING: 'modal' package not installed.{_err_detail} Run: pip install modal")
@@ -294,9 +286,80 @@ _counter_lock = asyncio.Lock()
 _MODAL_PROMPT_IDS: set = set()
 
 
-def _send(sid: str, event: str, data: dict):
+def _send(sid: str, event, data):
+    """Send one event to the browser.
+
+    `event` is either a ComfyUI event name ("progress_state", "executing",
+    ...) or one of the numeric binary event types - 4 is the preview frame
+    that carries the node metadata (comfy_api/protocol.py:2-6).
+    """
     if _server:
         _server.send_sync(event, data, sid)
+
+
+def _send_preview(sid: str, metadata: dict, image_bytes: bytes):
+    """Send a live preview frame to the browser.
+
+    The local ComfyUI server expects a type-4 preview as
+    (preview_image, metadata), where preview_image is the *decoded*
+    ("JPEG", PIL.Image, max_size) tuple - it encodes the image itself
+    (server.py:1386-1396 -> :1431-1466). The container ships bytes that are
+    already JPEG-encoded, so the frame is decoded here and handed over in the
+    shape the local server expects.
+    """
+    if not image_bytes:
+        return
+    try:
+        import io
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+        image_type = "PNG" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "JPEG"
+        if image_type == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+    except Exception as e:
+        print(f"[comfyui-modal] could not decode a preview frame: {e}")
+        return
+    _send(sid, 4, ((image_type, img, None), metadata))
+
+
+# Diagnostics for the live event relay.
+#
+# The relay fires on every sampler step of every generation, so a print per
+# event would drown the console. The counters are therefore off by default -
+# set COMFYUI_MODAL_DEBUG=1 to turn them back on when something looks wrong.
+# Errors are always printed, they are rare and they matter.
+_RELAY_DEBUG = os.environ.get("COMFYUI_MODAL_DEBUG", "").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+_relay_counts: dict = {}
+
+
+async def _relay_event(sid: str, item: dict):
+    """Forward one live event from the Modal container to the browser."""
+    kind = item.get("kind")
+    if _RELAY_DEBUG:
+        # Diagnostics: how much actually came through the relay.
+        _relay_counts[kind] = _relay_counts.get(kind, 0) + 1
+        total = sum(_relay_counts.values())
+        if total <= 6 or total % 25 == 0:
+            print(f"[comfyui-modal] relay {kind} (total {total}: {_relay_counts})")
+    if kind == "event":
+        event = item.get("event")
+        data = item.get("data")
+        if not event or data is None:
+            return
+        if event == "executing" and data.get("node") is None:
+            # The container's "the prompt is over" marker (main.py:392) is
+            # NOT relayed: this node sends its own one AFTER the "executed"
+            # events, which is the order stock ComfyUI uses
+            # (executed -> executing:null -> execution_success).
+            return
+        _send(sid, event, data)
+    elif kind == "preview":
+        _send_preview(sid, item.get("metadata") or {}, item.get("image") or b"")
 
 
 def _pq():
@@ -371,15 +434,36 @@ def _register_running(item: tuple):
     return key
 
 
-def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool):
+def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool,
+                messages=None, started_ms: int = None):
     _MODAL_PROMPT_IDS.discard(prompt_id)
     pq = _pq()
     if pq is None:
         return
+    # The duration the queue panel shows comes from these two timestamps: the
+    # frontend reads job.execution_start_time / execution_end_time, which
+    # comfy_execution/jobs.py:205-259 derives from status["messages"]. Every
+    # message must be an [event_name, data] pair whose data["timestamp"] is in
+    # milliseconds (jobs.py:226-238).
+    #
+    # `messages` are the CONTAINER's own status messages: ComfyUI stamped them
+    # during the real execution (execution.py:680-685), so they bracket the
+    # actual GPU work and do not include Modal's queueing and RPC overhead.
+    # When they are not available (an app that was not redeployed yet, or a
+    # failed run) the timestamps are measured locally instead, so the panel
+    # still shows a duration.
+    if not messages:
+        now = int(time.time() * 1000)
+        start = started_ms if started_ms is not None else now
+        messages = [
+            ["execution_start", {"prompt_id": prompt_id, "timestamp": start}],
+            ["execution_success" if success else "execution_error",
+             {"prompt_id": prompt_id, "timestamp": now}],
+        ]
     status = execution.PromptQueue.ExecutionStatus(
         status_str='success' if success else 'error',
         completed=success,
-        messages=[],
+        messages=messages,
     )
     history_result = {"outputs": outputs, "meta": {}}
     pq.task_done(item_id, history_result, status=status,
@@ -398,6 +482,12 @@ async def _process_queue():
 async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
     sid = extra_data.get("client_id", "")
+    # The preview method the browser asked for. It is stored under a
+    # "modal_" prefix so it can never be mistaken for ComfyUI's own
+    # "preview_method" key, which the LOCAL ComfyUI treats as a global
+    # preview-method override (execution.py:734).
+    preview_method = extra_data.get("modal_preview_method", "")
+    started_ms = int(time.time() * 1000)
 
     task_key = _register_running(item)
     if task_key is None:
@@ -408,16 +498,22 @@ async def _execute_job(item: tuple, item_id: int):
         _MODAL_PROMPT_IDS.discard(prompt_id)
         return
 
-    node_ids = list(workflow.keys())
     _send(sid, "execution_start", {"prompt_id": prompt_id})
     _send(sid, "execution_cached", {"nodes": [], "prompt_id": prompt_id})
 
-    for node_id in node_ids:
-        _send(sid, "executing", {"node": node_id, "display_node": node_id, "prompt_id": prompt_id})
-        await asyncio.sleep(0)
+    # The up-front "executing" storm is GONE. It used to be here:
+    #     node_ids = list(workflow.keys())
+    #     for node_id in node_ids:
+    #         _send(sid, "executing", {"node": node_id, "display_node": node_id, "prompt_id": prompt_id})
+    #         await asyncio.sleep(0)
+    # It lit up EVERY node in the graph before any work had started, which made
+    # the canvas look like it was already running. The real "executing" events
+    # now arrive from the container while the prompt actually runs, so the
+    # nodes light up in the right order.
 
     success = False
     outputs = {}
+    messages = None
     try:
         prepared_inputs = prepare_local_workflow_inputs(
             workflow,
@@ -425,15 +521,37 @@ async def _execute_job(item: tuple, item_id: int):
         )
         for missing_file in prepared_inputs.missing_files:
             print(f"[comfyui-modal] Warning: input image not found locally: {missing_file}")
-        result = await run_prompt(prepared_inputs.workflow, prepared_inputs.input_images)
+
+        async def relay(item):
+            """Forward the container's live events to the browser."""
+            await _relay_event(sid, item)
+
+        _relay_counts.clear()
+        result = await run_prompt(
+            prepared_inputs.workflow,
+            prepared_inputs.input_images,
+            prompt_id=prompt_id,
+            preview_method=preview_method,
+            on_event=relay,
+        )
+        # The container's own status messages carry the timestamps of the real
+        # execution - that is what the queue panel turns into a duration.
+        messages = result.get("messages")
         success = True
+        if _RELAY_DEBUG:
+            print(f"[comfyui-modal] relay summary for {prompt_id}: {_relay_counts}")
     except asyncio.CancelledError:
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
-        _finish_job(task_key, prompt_id, outputs, success=False)
+        _finish_job(task_key, prompt_id, outputs, success=False,
+                    messages=messages, started_ms=started_ms)
         raise
     except Exception as e:
+        import traceback
+        print(f"[comfyui-modal] prompt {prompt_id} failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
         _send(sid, "execution_error", {"message": str(e), "prompt_id": prompt_id})
-        _finish_job(task_key, prompt_id, outputs, success=False)
+        _finish_job(task_key, prompt_id, outputs, success=False,
+                    messages=messages, started_ms=started_ms)
         return
 
     output_dir = os.path.join(_COMFYUI_ROOT, "output")
@@ -486,7 +604,8 @@ async def _execute_job(item: tuple, item_id: int):
 
     _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
     _send(sid, "execution_success", {"prompt_id": prompt_id})
-    _finish_job(task_key, prompt_id, outputs, success=True)
+    _finish_job(task_key, prompt_id, outputs, success=True,
+                messages=messages, started_ms=started_ms)
 
 
 if _server:
@@ -536,11 +655,28 @@ if _server:
         client_id = body.get("client_id", str(uuid.uuid4()))
         prompt_id = str(uuid.uuid4())
 
+        # The browser sends its per-prompt settings in extra_data. Exactly ONE
+        # key is taken from it: preview_method, which decides whether the
+        # remote ComfyUI renders live previews at all. The rest of extra_data
+        # holds the user's ComfyUI.org credentials (auth_token_comfy_org /
+        # api_key_comfy_org) and the whole workflow under extra_pnginfo - none
+        # of that may be shipped to a third-party cloud.
+        browser_extra_data = body.get("extra_data") or {}
+        preview_method = browser_extra_data.get("preview_method") or ""
+
         import time
         async with _counter_lock:
             _item_counter += 1
             item_id = _item_counter
-            extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
+            extra_data = {
+                "client_id": client_id,
+                "create_time": int(time.time() * 1000),
+                # Namespaced with a "modal_" prefix: ComfyUI's own
+                # "preview_method" key is a GLOBAL preview-method override for
+                # the local server (execution.py:734), which is not what this
+                # is.
+                "modal_preview_method": preview_method,
+            }
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
         # Visible in the native queue (pending counts, /queue, delete/clear
@@ -694,6 +830,44 @@ if _server:
             return web.json_response(result)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+    @_server.routes.post("/comfymodal/models/{folder}/{filename}/placeholder")
+    async def modal_create_placeholder(request: web.Request) -> web.Response:
+        """Create a zero-byte local placeholder for a remote model.
+
+        Makes the model show up in ComfyUI's node dropdowns (model discovery)
+        without downloading the real weights, so a workflow can reference the
+        exact remote filename and still be routed to Modal.
+
+        SAFETY — never overwrites an existing file:
+        - folder/filename are reduced with os.path.basename (no path traversal);
+        - the file is opened in exclusive-create mode ("xb"), which raises
+          FileExistsError if ANY local file is already there — including a real,
+          large model. Existing files are reported and left byte-for-byte intact.
+        """
+        folder = os.path.basename(request.match_info.get("folder", ""))
+        filename = os.path.basename(request.match_info.get("filename", ""))
+        if not folder or not filename:
+            return web.json_response({"status": "error", "message": "folder and filename required"}, status=400)
+
+        target = os.path.join(_COMFYUI_ROOT, "models", folder, filename)
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "xb"):
+                pass  # zero-byte placeholder; "xb" refuses to touch an existing file
+        except FileExistsError:
+            # Existing file (real or placeholder): never truncate/overwrite it.
+            size = os.path.getsize(target)
+            return web.json_response({
+                "status": "exists",
+                "size": size,
+                "message": "Local file already exists — left untouched (never overwritten)",
+                "path": target,
+            })
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+        return web.json_response({"status": "ok", "path": target})
 
     @_server.routes.get("/comfymodal/sync/status")
     async def modal_sync_status(request: web.Request) -> web.Response:
