@@ -1022,9 +1022,13 @@ class _ComfyAPIMixin:
                     if counts is not None:
                         counts["text"] = counts.get("text", 0) + 1
                         counts[f"text:{event}"] = counts.get(f"text:{event}", 0) + 1
-                        if counts["text"] <= 6:
+                        # Only the first couple of events are dumped - the
+                        # counters below tell the whole story, and this log
+                        # would otherwise fill up with one line per sampler
+                        # step.
+                        if counts["text"] <= 2:
                             print(f"[comfyui-modal] ws text event: {event} "
-                                  f"{str(obj.get('data'))[:200]}")
+                                  f"{str(obj.get('data'))[:120]}")
                     if event in RELAYED_TEXT_EVENTS:
                         await queue.put({
                             "kind": "event",
