@@ -866,6 +866,7 @@ class _ComfyAPIMixin:
             prompt_id = str(uuid.uuid4())
 
         queue: asyncio.Queue = asyncio.Queue()
+        counts: dict = {}
 
         async with aiohttp.ClientSession() as session:
             url = f"http://127.0.0.1:{COMFYUI_API_PORT}/ws?clientId={client_id}"
@@ -880,7 +881,8 @@ class _ComfyAPIMixin:
                     "data": CONTAINER_CLIENT_FEATURE_FLAGS,
                 }))
 
-                reader = asyncio.create_task(self._ws_event_reader(ws, queue))
+                reader = asyncio.create_task(self._ws_event_reader(ws, queue, counts))
+                print(f"[comfyui-modal] event recorder connected (clientId={client_id}, prompt_id={prompt_id})")
                 try:
                     # The submission is a blocking urllib call, so it runs in
                     # a thread - otherwise it would stall the event loop and
@@ -948,6 +950,7 @@ class _ComfyAPIMixin:
                 finally:
                     reader.cancel()
                     watcher.cancel()
+                print(f"[comfyui-modal] event recorder summary: {counts}")
 
     def _interrupt_comfy(self, prompt_id: str = "") -> None:
         """Ask the container's own ComfyUI to stop the running prompt.
@@ -974,13 +977,15 @@ class _ComfyAPIMixin:
         except Exception as e:
             print(f"[comfyui-modal] could not interrupt the remote prompt: {e}")
 
-    async def _ws_event_reader(self, ws, queue):
+    async def _ws_event_reader(self, ws, queue, counts=None):
         """Read the container's own ComfyUI websocket and queue its events.
 
         Text frames are the JSON events ("progress", "progress_state",
         "executing", ...). Binary frames are the preview images; ComfyUI
         frames them as [4-byte event type][payload]
         (server.py:1398-1404, :1431-1466).
+
+        `counts` is an optional dict used for the diagnostics printout.
         """
         import asyncio
         import aiohttp
@@ -993,6 +998,9 @@ class _ComfyAPIMixin:
                         continue
                     event = int.from_bytes(data[:4], "big")
                     payload = data[4:]
+                    if counts is not None:
+                        counts["binary"] = counts.get("binary", 0) + 1
+                        counts[f"binary:{event}"] = counts.get(f"binary:{event}", 0) + 1
                     if event == BINARY_EVENT_PREVIEW_IMAGE_WITH_METADATA:
                         item = self._decode_preview_frame(payload)
                         if item is not None:
@@ -1006,6 +1014,12 @@ class _ComfyAPIMixin:
                     except Exception:
                         continue
                     event = obj.get("type")
+                    if counts is not None:
+                        counts["text"] = counts.get("text", 0) + 1
+                        counts[f"text:{event}"] = counts.get(f"text:{event}", 0) + 1
+                        if counts["text"] <= 6:
+                            print(f"[comfyui-modal] ws text event: {event} "
+                                  f"{str(obj.get('data'))[:200]}")
                     if event in RELAYED_TEXT_EVENTS:
                         await queue.put({
                             "kind": "event",
@@ -1017,11 +1031,13 @@ class _ComfyAPIMixin:
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.ERROR,
                 ):
+                    print(f"[comfyui-modal] event recorder: websocket closed "
+                          f"(type={msg.type}), counts={counts}")
                     break
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[comfyui-modal] event reader stopped: {e}")
+            print(f"[comfyui-modal] event reader stopped: {e} (counts={counts})")
 
     @staticmethod
     def _decode_preview_frame(payload: bytes):

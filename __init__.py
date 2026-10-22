@@ -324,9 +324,17 @@ def _send_preview(sid: str, metadata: dict, image_bytes: bytes):
     _send(sid, 4, ((image_type, img, None), metadata))
 
 
+_relay_counts: dict = {}
+
+
 async def _relay_event(sid: str, item: dict):
     """Forward one live event from the Modal container to the browser."""
     kind = item.get("kind")
+    # Diagnostics: how much actually came through the relay.
+    _relay_counts[kind] = _relay_counts.get(kind, 0) + 1
+    total = sum(_relay_counts.values())
+    if total <= 6 or total % 25 == 0:
+        print(f"[comfyui-modal] relay {kind} (total {total}: {_relay_counts})")
     if kind == "event":
         event = item.get("event")
         data = item.get("data")
@@ -507,6 +515,7 @@ async def _execute_job(item: tuple, item_id: int):
             """Forward the container's live events to the browser."""
             await _relay_event(sid, item)
 
+        _relay_counts.clear()
         result = await run_prompt(
             prepared_inputs.workflow,
             prepared_inputs.input_images,
@@ -518,6 +527,7 @@ async def _execute_job(item: tuple, item_id: int):
         # execution - that is what the queue panel turns into a duration.
         messages = result.get("messages")
         success = True
+        print(f"[comfyui-modal] relay summary for {prompt_id}: {_relay_counts}")
     except asyncio.CancelledError:
         _send(sid, "execution_error", {"message": "cancelled", "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False,
