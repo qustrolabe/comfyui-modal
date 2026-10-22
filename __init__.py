@@ -534,6 +534,9 @@ async def _execute_job(item: tuple, item_id: int):
                     messages=messages, started_ms=started_ms)
         raise
     except Exception as e:
+        import traceback
+        print(f"[comfyui-modal] prompt {prompt_id} failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
         _send(sid, "execution_error", {"message": str(e), "prompt_id": prompt_id})
         _finish_job(task_key, prompt_id, outputs, success=False,
                     messages=messages, started_ms=started_ms)

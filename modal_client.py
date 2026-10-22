@@ -65,9 +65,9 @@ def _modal_error_handler(func):
 def _is_missing_method(exc: Exception) -> bool:
     """True when the error means "the deployed app cannot stream a prompt".
 
-    Used to fall back to the plain (non-streaming) prompt method when the
-    cloud app was not redeployed after the streaming one was added, or when
-    the deployed Modal version cannot run generator methods.
+    Kept for reference: the fallback now triggers on ANY failure that happens
+    before the container acknowledged the prompt, because that is the only
+    case where running the prompt a second time is safe.
     """
     if type(exc).__name__ in ("NotFoundError", "InvalidError"):
         return True
@@ -85,14 +85,14 @@ def _is_missing_method(exc: Exception) -> bool:
 async def _run_streaming(api, workflow, input_images, prompt_id, client_id, preview_method, on_event):
     """Consume the container's streaming prompt method.
 
-    Returns the result dict, or None when the deployed app does not have the
-    streaming method (or the deployed Modal version cannot run generators) -
-    the caller then falls back to the plain, non-streaming method.
+    Returns the result dict, or None when the streaming path could not be
+    used - the caller then falls back to the plain (non-streaming) method.
     """
     try:
         stream_fn = api.run_prompt_stream
-    except Exception:
+    except Exception as e:
         # The deployed app predates run_prompt_stream.
+        print(f"[comfyui-modal] no streaming prompt method: {type(e).__name__}: {e}")
         return None
 
     got_item = False
@@ -106,17 +106,28 @@ async def _run_streaming(api, workflow, input_images, prompt_id, client_id, prev
                 # its own so the RPC is closed cleanly.
                 result = item.get("result")
                 continue
+            if kind == "started":
+                # The container has the prompt now - from here on a failure
+                # must NOT be retried with the plain method, because that
+                # would run the prompt twice.
+                got_item = True
+                continue
             got_item = True
             if on_event is not None:
                 await on_event(item)
     except Exception as e:
-        if got_item or not _is_missing_method(e):
+        if got_item:
+            # The prompt is already running on the container; retrying it
+            # would generate it twice. Let the error through.
             raise
-        print(
-            f"[comfyui-modal] the deployed app has no streaming prompt method ({e}); "
-            f"using the plain one - live progress and previews stay off until "
-            f"the app is redeployed"
-        )
+        # Nothing came back at all, so the prompt was (almost certainly)
+        # never submitted - fall back to the plain method instead of failing
+        # the run.
+        import traceback
+        print(f"[comfyui-modal] the streaming prompt method failed, using the "
+              f"plain one (live progress and previews stay off): "
+              f"{type(e).__name__}: {e}")
+        traceback.print_exc()
         return None
     finally:
         try:

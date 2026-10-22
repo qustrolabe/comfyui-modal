@@ -901,6 +901,11 @@ class _ComfyAPIMixin:
 
                 remote_prompt_id = queued.get("prompt_id", prompt_id)
 
+                # Tell the caller that the prompt is now the container's
+                # problem. From this point on the caller must NOT retry it
+                # with the plain method, because that would run it twice.
+                yield {"kind": "started", "prompt_id": remote_prompt_id}
+
                 async def watch_completion():
                     try:
                         result = await asyncio.to_thread(
