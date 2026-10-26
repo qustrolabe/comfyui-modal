@@ -1,5 +1,66 @@
 # comfyui-modal
 
+This repo is a fork of [cbsakura/comfyui-modal](https://github.com/cbsakura/comfyui-modal) that itself is a fork of [JunnnnyWon/comfyui-modal](https://github.com/JunnnnyWon/comfyui-modal).
+
+I fixed some things for myself with AI and added some new features.
+
+
+## How this project works?
+
+It's a ComfyUI plugin that you install into `custom_nodes` folder that adds new section to left sidebar that allows you to deploy special ComfyUI container on [modal.com](https://modal.com/). You build workflows in your local ComfyUI and when you're ready just hit usual `Run` to start generation. Entire workflow with prompt and any other input data is sent to Modal container that wakes up, starts GPU and starts generating and then sends back final output.
+
+When you're done for today you just leave Modal App hanging there deployed and close Comfy. It stays awake for few minutes and then all containers go **Inactive** and no longer tick usage money. Double check that.
+
+Next time you run generation it will wake up GPU container that should restore itself from memory snapshot in few seconds (instead of downloading all packages and starting ComfyUI for several minutes!), load model and start generating.
+
+As you keep this app deployed and add new changes and bump `COMFYAPP_VERSION` hitting redeploy will quickly update necessary parts and you're good to go. First initial deploy will be very slow, as well as when you sync custom nodes and it'll need to restart and install their packages.
+
+There's separate button to sync custom nodes from your local instance, it just packs them and sends to separate modal volume. Then redeploys to install packages.
+
+Installing models also happens to separate volume. You need to provide direct HF or Civitai link, selector folder and filename and hit download. Watch logs for progress.
+
+## Features and fixes:
+
+- bumped ComfyUI installer version
+- exposed string to pin desired ComfyUI version instead of latest
+- removed redundant hanging remote UI container that served no purpose and was publicly available to anyone with a link
+- **fixed generation progress display**, now those things work. now: 
+  1) generation properly displays how long it took.
+  2) active generation properly sends how many steps remaining.
+  3) **live preview** if enabled now properly sent to your local client (might not work with some models, tested with Anima) 
+- added to remote models list button to create local empty model placeholder files that mirror models on remote and allows them to be selectable on your local comfy
+- disable auto-deploy
+- bug fixes for weird behavior that lead to doom loops of comfy trying to restart over and over without killing old instance
+
+## TODOs to improve
+
+- instead of local model placeholders just sync model lists with remote like [anr2me/comfyui-proxy](https://github.com/anr2me/comfyui-proxy) does
+- instead of pinned ComfyUI version suggest syncing to users' current version
+- add better model downloader with Civitai support
+- add better remote volume file management
+
+## Tips, tricks, troubleshooting:
+
+- trick to download models from Civitai: on your local machine on civitai hit download then stop immediately, go to downloads list and copy long link with all necessary tokens and paste it into this plugin's downloader section
+- if you want to disable this plugin and start ComfyUI normally, you can either fully remove its folder or rename it to `comfyui-modal.disabled` which makes ComfyUI skip it on startup
+- read logs on Modal dashboard (or let your agent do that with `modal app logs comfyui -n 400`) to know why generation doesn't work. Common issues are: version mismatch, missing custom nodes and not yet fully deployed app.
+- you need to do modal auth and make sure modal package is installed on python environemnt that your local comfy uses. **check original README.md below for instructions**.
+
+## alternative approaches to ComfyUI on modal
+
+Other repos with their own methods that have some advantages and disadvantages, own set of bugs and ways to download models and custom nodes.
+
+1. [caru-ini/modal-comfyui](https://github.com/caru-ini/modal-comfyui) - plugins and models defined in config files and you deploy manually from console. what you get is a remotely accessible instance running on modal container with no need for local instance of comfy. adding new custom nodes or models requires redeploy. biggest con is that there's no security whatsoever, anyone with your public link can just go use your instance and waste your money
+2. [anr2me/modal-comfyui](https://github.com/anr2me/modal-comfyui) + [anr2me/comfyui-proxy](https://github.com/anr2me/comfyui-proxy) - is a fork of `caru-ini/modal-comfyui`, plus a proxy extension for your local ComfyUI that can use deploy apps link to send and recieve generations properly. some fixes ahead of original repo. Modal itself got this featue called [Proxy Tokens](https://modal.com/docs/guide/webhook-proxy-auth) that allows using these two repos to get secure deployment that requires additional Bearer token on top of deployed public link for each request.
+3. [I'm not sure this one even works at the moment] [ttulttul/ComfyUI-Modal](https://github.com/ttulttul/ComfyUI-Modal) - very different approach, a plugin that adds to every node in your workflow a toggle that lets you either run it locally or on modal so complex hybrid workflows where some things happen locally and some remotely and it goes back and forth should be possible. I don't have use for that and never got it to work but sounds interesting. 
+
+---
+
+<details>
+  <summary>original cbsakura/comfyui-modal README.md</summary>
+
+# comfyui-modal
+
 **Run ComfyUI image generation on [Modal](https://modal.com) GPU cloud — directly from your local ComfyUI.**
 
 No need to manage servers or pay for idle time. Modal spins up a GPU container on demand and shuts it down automatically when you're done.
@@ -303,3 +364,5 @@ The `comfyapp.py` file defines the Modal app — three independent GPU classes (
 ## License
 
 MIT
+
+</details>
