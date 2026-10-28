@@ -648,13 +648,27 @@ class _ComfyAPIMixin:
 
     def _wait_for_comfy(self):
         import urllib.request
-        for _ in range(120):
+        # A fresh container has to build the whole image-side startup: fonts,
+        # the Impact packs, RMBG and controlnet_aux. That took just over two
+        # minutes on this image, so the old 120s cap killed every snapshot
+        # build and forced Modal to fall back to an older snapshot. The
+        # snapshot restore path is fast; only this first boot is slow.
+        started = time.monotonic()
+        last_report = 0
+        while time.monotonic() - started < 600:
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{COMFYUI_API_PORT}/system_stats")
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{COMFYUI_API_PORT}/system_stats", timeout=5
+                ) as response:
+                    response.read()
                 return
             except Exception:
+                elapsed = int(time.monotonic() - started)
+                if elapsed - last_report >= 30:
+                    last_report = elapsed
+                    print(f"[comfyui-modal] waiting for ComfyUI API ({elapsed}s)")
                 time.sleep(1)
-        raise RuntimeError("ComfyUI API failed to start")
+        raise RuntimeError("ComfyUI API failed to start within 600s")
 
     @modal.method()
     def object_info(self):
