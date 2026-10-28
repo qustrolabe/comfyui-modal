@@ -479,6 +479,28 @@ async def _process_queue():
             _queue.task_done()
 
 
+def _register_output_asset(entry: dict, abs_path: str, prompt_id: str):
+    """Give a downloaded output its local asset record.
+
+    The stock executor registers every emitted output through the asset
+    manager (execution.py:576). These files are written here instead, so
+    they must go through the same manager: the filesystem seeder only
+    rescans at startup and on /object_info, so a file written after that
+    would otherwise never reach the Assets panel.
+    """
+    if _server is None:
+        return
+    try:
+        registered = _server.asset_manager.register_executed_output(abs_path, prompt_id)
+    except Exception as e:
+        print(f"[comfyui-modal] could not register {entry['filename']} as an asset: {e}")
+        return
+    if registered is not None:
+        entry["id"] = registered.id
+        if registered.preview_id:
+            entry["preview_id"] = registered.preview_id
+
+
 async def _execute_job(item: tuple, item_id: int):
     number, prompt_id, workflow, extra_data, _, _ = item
     sid = extra_data.get("client_id", "")
@@ -567,6 +589,7 @@ async def _execute_job(item: tuple, item_id: int):
 
         node_id = img["node_id"]
         img_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
+        _register_output_asset(img_entry, local_path, prompt_id)
 
         if node_id not in outputs:
             outputs[node_id] = {"images": []}
@@ -589,6 +612,7 @@ async def _execute_job(item: tuple, item_id: int):
 
         node_id = vid["node_id"]
         vid_entry = {"filename": local_filename, "subfolder": "", "type": "output"}
+        _register_output_asset(vid_entry, local_path, prompt_id)
 
         if node_id not in outputs:
             outputs[node_id] = {"images": [], "animated": (True,)}
