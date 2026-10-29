@@ -38,6 +38,7 @@ Installing models also happens to separate volume. You need to provide direct HF
 - instead of pinned ComfyUI version suggest syncing to users' current version
 - add better model downloader with Civitai support
 - add better remote volume file management
+- BUG: apparently canceling running job doesn't work for some reason
 
 ## Tips, tricks, troubleshooting:
 
@@ -45,6 +46,8 @@ Installing models also happens to separate volume. You need to provide direct HF
 - if you want to disable this plugin and start ComfyUI normally, you can either fully remove its folder or rename it to `comfyui-modal.disabled` which makes ComfyUI skip it on startup
 - read logs on Modal dashboard (or let your agent do that with `modal app logs comfyui -n 400`) to know why generation doesn't work. Common issues are: version mismatch, missing custom nodes and not yet fully deployed app.
 - you need to do modal auth and make sure modal package is installed on python environemnt that your local comfy uses. **check original README.md below for instructions**.
+- **Why does hitting run after short pause sometimes start remote comfy again instead of quickly loading memory snapshot?** - I'm not sure on that one 100%, needs more investigation. My current version if that's not a bug and what my agent dug up in docs is that on Modal same "Function" while running one kind of GPU, might end up running on several slightly different hardware setups that all need their own snapshot, so you'll need few of those before it'll have comfortable ready state for all of them it can load.
+- If you're downloading models to remote that you never use locally I recomend prefixing them with `modal_` that way when placeholders get created it's either to distinguish them. Opposed to that is having remote and local models have exact same name so that you could reuse workflows without need to switch models.
 
 ## alternative approaches to ComfyUI on modal
 
