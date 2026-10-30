@@ -39,6 +39,8 @@ Installing models also happens to separate volume. You need to provide direct HF
 - add better model downloader with Civitai support
 - add better remote volume file management
 - BUG: apparently canceling running job doesn't work for some reason
+- currently unable to use "Preview as Text" type of nodes as hitting run on them instead fires entire new generation and doesn't even fill their output
+
 
 ## Tips, tricks, troubleshooting:
 
@@ -48,6 +50,7 @@ Installing models also happens to separate volume. You need to provide direct HF
 - you need to do modal auth and make sure modal package is installed on python environemnt that your local comfy uses. **check original README.md below for instructions**.
 - **Why does hitting run after short pause sometimes start remote comfy again instead of quickly loading memory snapshot?** - I'm not sure on that one 100%, needs more investigation. My current version if that's not a bug and what my agent dug up in docs is that on Modal same "Function" while running one kind of GPU, might end up running on several slightly different hardware setups that all need their own snapshot, so you'll need few of those before it'll have comfortable ready state for all of them it can load.
 - If you're downloading models to remote that you never use locally I recomend prefixing them with `modal_` that way when placeholders get created it's either to distinguish them. Opposed to that is having remote and local models have exact same name so that you could reuse workflows without need to switch models.
+- updating is tricky at the moment you basically need to: bump `COMFYAPPVERSION` and `COMFYUI_VERSION`, launch comfy hit deploy, restart comfy, try running workflow. sometimes it doesn't update on remote right away and still runs with old comfyui version, usually fixes itself after few mins
 
 ## alternative approaches to ComfyUI on modal
 

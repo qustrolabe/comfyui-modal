@@ -36,7 +36,7 @@ except ImportError:
 # events (progress / executing / preview frames) back to the browser while the
 # prompt is running, and it returns its own status messages so the queue panel
 # can show the real execution duration. See run_prompt_stream().
-COMFYAPP_VERSION = "2.0.14"
+COMFYAPP_VERSION = "2.0.15"
 
 # ComfyUI release installed into the Modal image.
 #
@@ -56,7 +56,7 @@ COMFYAPP_VERSION = "2.0.14"
 #
 # To update ComfyUI on Modal: change this number and redeploy. Every change
 # to it forces a fresh image build.
-COMFYUI_VERSION = "0.42.1"
+COMFYUI_VERSION = "0.43.2"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
